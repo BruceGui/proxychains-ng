@@ -52,7 +52,7 @@ CFLAGS_MAIN=-DLIB_DIR=\"$(libdir)\" -DSYSCONFDIR=\"$(sysconfdir)\" -DDLL_NAME=\"
 
 all: $(ALL_LIBS) $(ALL_TOOLS)
 
-install: install-libs install-tools
+install: install-libs install-tools install-config
 
 $(DESTDIR)$(bindir)/%: %
 	$(INSTALL) -D -m 755 $< $@
