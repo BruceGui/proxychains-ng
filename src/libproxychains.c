@@ -78,7 +78,7 @@ pthread_once_t init_once = PTHREAD_ONCE_INIT;
 
 static int init_l = 0;
 
-static inline void get_chain_data(proxy_data * pd, unsigned int *proxy_count, chain_type * ct);
+static void get_chain_data(proxy_data * pd, unsigned int *proxy_count, chain_type * ct);
 
 static void* load_sym(char* symname, void* proxyfunc) {
 
@@ -160,6 +160,107 @@ static void gcc_init(void) {
 }
 #endif
 
+
+typedef enum {
+	RS_PT_NONE = 0,
+	RS_PT_SOCKS4,
+	RS_PT_SOCKS5,
+	RS_PT_HTTP
+} rs_proxyType;
+
+/*
+  proxy_from_string() taken from rocksock network I/O library (C) rofl0r
+  valid inputs:
+	socks5://user:password@proxy.domain.com:port
+	socks5://proxy.domain.com:port
+	socks4://proxy.domain.com:port
+	http://user:password@proxy.domain.com:port
+	http://proxy.domain.com:port
+
+	supplying port number is obligatory.
+	user:pass@ part is optional for http and socks5.
+	however, user:pass authentication is currently not implemented for http proxies.
+  return 1 on success, 0 on error.
+*/
+static int proxy_from_string(const char *proxystring,
+	char *type_buf,
+	char* host_buf,
+	int *port_n,
+	char *user_buf,
+	char* pass_buf)
+{
+	const char* p;
+	rs_proxyType proxytype;
+
+	size_t next_token = 6, ul = 0, pl = 0, hl;
+	if(!proxystring[0] || !proxystring[1] || !proxystring[2] || !proxystring[3] || !proxystring[4] || !proxystring[5]) goto inv_string;
+	if(*proxystring == 's') {
+		switch(proxystring[5]) {
+			case '5': proxytype = RS_PT_SOCKS5; break;
+			case '4': proxytype = RS_PT_SOCKS4; break;
+			default: goto inv_string;
+		}
+	} else if(*proxystring == 'h') {
+		proxytype = RS_PT_HTTP;
+		next_token = 4;
+	} else goto inv_string;
+	if(
+	   proxystring[next_token++] != ':' ||
+	   proxystring[next_token++] != '/' ||
+	   proxystring[next_token++] != '/') goto inv_string;
+	const char *at = strrchr(proxystring+next_token, '@');
+	if(at) {
+		if(proxytype == RS_PT_SOCKS4)
+			return 0;
+		p = strchr(proxystring+next_token, ':');
+		if(!p || p >= at) goto inv_string;
+		const char *u = proxystring+next_token;
+		ul = p-u;
+		p++;
+		pl = at-p;
+		if(proxytype == RS_PT_SOCKS5 && (ul > 255 || pl > 255))
+			return 0;
+		memcpy(user_buf, u, ul);
+		user_buf[ul]=0;
+		memcpy(pass_buf, p, pl);
+		pass_buf[pl]=0;
+		next_token += 2+ul+pl;
+	} else {
+		user_buf[0]=0;
+		pass_buf[0]=0;
+	}
+	const char* h = proxystring+next_token;
+	p = strchr(h, ':');
+	if(!p) goto inv_string;
+	hl = p-h;
+	if(hl > 255)
+		return 0;
+	memcpy(host_buf, h, hl);
+	host_buf[hl]=0;
+	*port_n = atoi(p+1);
+	switch(proxytype) {
+		case RS_PT_SOCKS4:
+			strcpy(type_buf, "socks4");
+			break;
+		case RS_PT_SOCKS5:
+			strcpy(type_buf, "socks5");
+			break;
+		case RS_PT_HTTP:
+			strcpy(type_buf, "http");
+			break;
+		default:
+			return 0;
+	}
+	return 1;
+inv_string:
+	return 0;
+}
+
+static const char* bool_str(int bool_val) {
+	if(bool_val) return "true";
+	return "false";
+}
+
 /* get configuration from config file */
 static void get_chain_data(proxy_data * pd, unsigned int *proxy_count, chain_type * ct) {
 	int count = 0, port_n = 0, list = 0;
@@ -202,9 +303,11 @@ static void get_chain_data(proxy_data * pd, unsigned int *proxy_count, chain_typ
 
 				int ret = sscanf(buff, "%s %s %d %s %s", type, host, &port_n, pd[count].user, pd[count].pass);
 				if(ret < 3 || ret == EOF) {
-					inv:
-					fprintf(stderr, "error: invalid item in proxylist section: %s", buff);
-					exit(1);
+					if(!proxy_from_string(buff, type, host, &port_n, pd[count].user, pd[count].pass)) {
+						inv:
+						fprintf(stderr, "error: invalid item in proxylist section: %s", buff);
+						exit(1);
+					}
 				}
 
 				memset(&pd[count].ip, 0, sizeof(pd[count].ip));
@@ -212,8 +315,20 @@ static void get_chain_data(proxy_data * pd, unsigned int *proxy_count, chain_typ
 				pd[count].port = htons((unsigned short) port_n);
 				ip_type* host_ip = &pd[count].ip;
 				if(1 != inet_pton(host_ip->is_v6 ? AF_INET6 : AF_INET, host, host_ip->addr.v6)) {
-					fprintf(stderr, "proxy %s has invalid value or is not numeric\n", host);
-					exit(1);
+					if(*ct == STRICT_TYPE && proxychains_resolver && count > 0) {
+						/* we can allow dns hostnames for all but the first proxy in the list if chaintype is strict, as remote lookup can be done */
+						ip_type4 internal_ip = at_get_ip_for_host(host, strlen(host));
+						pd[count].ip.is_v6 = 0;
+						host_ip->addr.v4 = internal_ip;
+						if(internal_ip.as_int == ip_type_invalid.addr.v4.as_int)
+							goto inv_host;
+					} else {
+inv_host:
+						fprintf(stderr, "proxy %s has invalid value or is not numeric\n", host);
+						fprintf(stderr, "non-numeric ips are only allowed under the following circumstances:\n");
+						fprintf(stderr, "chaintype == strict (%s), proxy is not first in list (%s), proxy_dns active (%s)\n\n", bool_str(*ct == STRICT_TYPE), bool_str(count > 0), bool_str(proxychains_resolver));
+						exit(1);
+					}
 				}
 
 				if(!strcmp(type, "http")) {
@@ -317,6 +432,7 @@ static void get_chain_data(proxy_data * pd, unsigned int *proxy_count, chain_typ
 	}
 	*proxy_count = count;
 	proxychains_got_chain_data = 1;
+	PDEBUG("proxy_dns: %s\n", proxychains_resolver ? "ON" : "OFF");
 }
 
 /*******  HOOK FUNCTIONS  *******/
@@ -371,6 +487,10 @@ int connect(int sock, const struct sockaddr *addr, unsigned int len) {
 		memcpy(&v4inv6.s_addr, &p_addr_in6->s6_addr[12], 4);
 		v6 = dest_ip.is_v6 = 0;
 		p_addr_in = &v4inv6;
+	}
+	if(!v6 && !memcmp(p_addr_in, "\0\0\0\0", 4)) {
+		errno = ECONNREFUSED;
+		return -1;
 	}
 
 //      PDEBUG("localnet: %s; ", inet_ntop(AF_INET,&in_addr_localnet, str, sizeof(str)));

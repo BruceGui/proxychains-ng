@@ -19,6 +19,11 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 
+#ifdef IS_MAC
+#define _DARWIN_C_SOURCE
+#endif
+#include <dlfcn.h>
+
 #include "common.h"
 
 static int usage(char **argv) {
@@ -49,7 +54,7 @@ static void set_own_dir(const char *argv0) {
 	size_t l = strlen(argv0);
 	while(l && argv0[l - 1] != '/')
 		l--;
-	if(l == 0)
+	if(l == 0 || l >= sizeof(own_dir))
 #ifdef SUPER_SECURE
 		memcpy(own_dir, "/dev/null/", 11);
 #else
@@ -71,6 +76,9 @@ int main(int argc, char *argv[]) {
 	int quiet = 0;
 	size_t i;
 	const char *prefix = NULL;
+
+	if(argc == 2 && !strcmp(argv[1], "--help"))
+		return usage(argv);
 
 	for(i = 0; i < MAX_COMMANDLINE_FLAGS; i++) {
 		if(start_argv < argc && argv[start_argv][0] == '-') {
@@ -108,7 +116,9 @@ int main(int argc, char *argv[]) {
 
 	// search DLL
 
-	set_own_dir(argv[0]);
+	Dl_info dli;
+	dladdr(own_dir, &dli);
+	set_own_dir(dli.dli_fname);
 
 	i = 0;
 

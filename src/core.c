@@ -38,6 +38,7 @@
 #include "core.h"
 #include "common.h"
 #include "allocator_thread.h"
+#include "mutex.h"
 
 extern int tcp_read_time_out;
 extern int tcp_connect_time_out;
@@ -106,7 +107,7 @@ static void encode_base_64(char *src, char *dest, int max_len) {
 }
 
 void proxychains_write_log(char *str, ...) {
-	char buff[1024*20];
+	char buff[1024*4];
 	va_list arglist;
 	if(!proxychains_quiet_mode) {
 		va_start(arglist, str);
@@ -350,12 +351,15 @@ static int tunnel_to(int sock, ip_type ip, unsigned short port, proxy_type pt, c
 
 				if(2 != read_n_bytes(sock, in, 2))
 					goto err;
-				if(in[0] != 1 || in[1] != 0) {
-					if(in[0] != 1)
-						goto err;
-					else
-						return BLOCKED;
-				}
+	/* according to RFC 1929 the version field for the user/pass auth sub-
+	   negotiation should be 1, which is kinda counter-intuitive, so there
+	   are some socks5 proxies that return 5 instead. other programs like
+	   curl work fine when the version is 5, so let's do the same and accept
+	   either of them. */
+				if(!(in[0] == 5 || in[0] == 1))
+					goto err;
+				if(in[1] != 0)
+					return BLOCKED;
 			}
 			int buff_iter = 0;
 			buff[buff_iter++] = 5;	// version
@@ -564,8 +568,8 @@ int connect_proxy_chain(int sock, ip_type target_ip,
 	unsigned int offset = 0;
 	unsigned int alive_count = 0;
 	unsigned int curr_len = 0;
-	unsigned int curr_pos = 0;
 	unsigned int looped = 0; // went back to start of list in RR mode
+	unsigned int rr_loop_max = 14;
 
 	p3 = &p4;
 
@@ -602,23 +606,27 @@ int connect_proxy_chain(int sock, ip_type target_ip,
 
 		case ROUND_ROBIN_TYPE:
 			alive_count = calc_alive(pd, proxy_count);
-			curr_pos = offset = proxychains_proxy_offset;
+			offset = proxychains_proxy_offset;
 			if(alive_count < max_chain)
 				goto error_more;
-                        PDEBUG("1:rr_offset = %d, curr_pos = %d\n", offset, curr_pos);
+			PDEBUG("1:rr_offset = %d\n", offset);
 			/* Check from current RR offset til end */
 			for (;rc != SUCCESS;) {
 				if (!(p1 = select_proxy(FIFOLY, pd, proxy_count, &offset))) {
 					/* We've reached the end of the list, go to the start */
  					offset = 0;
 					looped++;
-					continue;
-				} else if (looped && rc > 0 && offset >= curr_pos) {
- 					PDEBUG("GOTO MORE PROXIES 0\n");
-					/* We've gone back to the start and now past our starting position */
-					proxychains_proxy_offset = 0;
- 					goto error_more;
- 				}
+					if (looped > rr_loop_max) {
+						proxychains_proxy_offset = 0;
+						goto error_more;
+					} else {
+						PDEBUG("rr_type all proxies down, release all\n");
+						release_all(pd, proxy_count);
+						/* Each loop we wait 10ms more */
+						usleep(10000 * looped);
+						continue;
+					}
+				}
  				PDEBUG("2:rr_offset = %d\n", offset);
  				rc=start_chain(&ns, p1, RRT);
 			}
@@ -721,10 +729,13 @@ int connect_proxy_chain(int sock, ip_type target_ip,
 	return -1;
 }
 
+static pthread_mutex_t servbyname_lock;
 void core_initialize(void) {
+	MUTEX_INIT(&servbyname_lock);
 }
 
 void core_unload(void) {
+	MUTEX_DESTROY(&servbyname_lock);
 }
 
 static void gethostbyname_data_setstring(struct gethostbyname_data* data, char* name) {
@@ -778,7 +789,7 @@ struct hostent *proxy_gethostbyname(const char *name, struct gethostbyname_data*
 
 struct addrinfo_data {
 	struct addrinfo addrinfo_space;
-	struct sockaddr sockaddr_space;
+	struct sockaddr_storage sockaddr_space;
 	char addr_name[256];
 };
 
@@ -787,18 +798,17 @@ void proxy_freeaddrinfo(struct addrinfo *res) {
 	free(res);
 }
 
-#if defined(IS_MAC) || defined(IS_OPENBSD) || defined(IS_SOLARIS)
-#if defined(IS_OPENBSD) || defined(IS_SOLARIS) /* OpenBSD and Solaris has its own incompatible getservbyname_r */
-#define getservbyname_r mygetservbyname_r
-#endif
-/* getservbyname on mac is using thread local storage, so we dont need mutex 
-   TODO: check if the same applies to OpenBSD */
-static int getservbyname_r(const char* name, const char* proto, struct servent* result_buf, 
+static int mygetservbyname_r(const char* name, const char* proto, struct servent* result_buf,
 			   char* buf, size_t buflen, struct servent** result) {
 	PFUNC();
+#ifdef HAVE_GNU_GETSERVBYNAME_R
+	PDEBUG("using host getservbyname_r\n");
+	return getservbyname_r(name, proto, result_buf, buf, buflen, result);
+#endif
 	struct servent *res;
 	int ret;
 	(void) buf; (void) buflen;
+	MUTEX_LOCK(&servbyname_lock);
 	res = getservbyname(name, proto);
 	if(res) {
 		*result_buf = *res;
@@ -808,9 +818,36 @@ static int getservbyname_r(const char* name, const char* proto, struct servent* 
 		*result = NULL;
 		ret = ENOENT;
 	}
+	MUTEX_UNLOCK(&servbyname_lock);
 	return ret;
 }
-#endif
+
+static int looks_like_numeric_ipv6(const char *node)
+{
+	if(!strchr(node, ':')) return 0;
+	const char* p= node;
+	while(1) switch(*(p++)) {
+		case 0: return 1;
+		case ':': case '.':
+		case '0': case '1': case '2': case '3': case '4':
+		case '5': case '6': case '7': case '8': case '9':
+		case 'A': case 'B': case 'C': case 'D': case 'E': case 'F':
+		case 'a': case 'b': case 'c': case 'd': case 'e': case 'f':
+			break;
+		default: return 0;
+	}
+}
+
+static int my_inet_aton(const char *node, struct addrinfo_data* space)
+{
+	int ret;
+	((struct sockaddr_in *) &space->sockaddr_space)->sin_family = AF_INET;
+	ret = inet_aton(node, &((struct sockaddr_in *) &space->sockaddr_space)->sin_addr);
+	if(ret || !looks_like_numeric_ipv6(node)) return ret;
+	ret = inet_pton(AF_INET6, node, &((struct sockaddr_in6 *) &space->sockaddr_space)->sin6_addr);
+	if(ret) ((struct sockaddr_in6 *) &space->sockaddr_space)->sin6_family = AF_INET6;
+	return ret;
+}
 
 int proxy_getaddrinfo(const char *node, const char *service, const struct addrinfo *hints, struct addrinfo **res) {
 	struct gethostbyname_data ghdata;
@@ -820,14 +857,14 @@ int proxy_getaddrinfo(const char *node, const char *service, const struct addrin
 	struct servent se_buf;
 	struct addrinfo *p;
 	char buf[1024];
-	int port;
+	int port, af = AF_INET;
 	PFUNC();
 
 //      printf("proxy_getaddrinfo node %s service %s\n",node,service);
 	space = calloc(1, sizeof(struct addrinfo_data));
 	if(!space) goto err1;
 
-	if(node && !inet_aton(node, &((struct sockaddr_in *) &space->sockaddr_space)->sin_addr)) {
+	if(node && !my_inet_aton(node, space)) {
 		/* some folks (nmap) use getaddrinfo() with AI_NUMERICHOST to check whether a string
 		   containing a numeric ip was passed. we must return failure in that case. */
 		if(hints && (hints->ai_flags & AI_NUMERICHOST)) {
@@ -840,22 +877,31 @@ int proxy_getaddrinfo(const char *node, const char *service, const struct addrin
 			       *(hp->h_addr_list), sizeof(in_addr_t));
 		else
 			goto err2;
+	} else if(node) {
+		af = ((struct sockaddr_in *) &space->sockaddr_space)->sin_family;
+	} else if(!node && !(hints->ai_flags & AI_PASSIVE)) {
+		af = ((struct sockaddr_in *) &space->sockaddr_space)->sin_family = AF_INET;
+		memcpy(&((struct sockaddr_in *) &space->sockaddr_space)->sin_addr,
+		       (char[]){127,0,0,1}, 4);
 	}
-	if(service) getservbyname_r(service, NULL, &se_buf, buf, sizeof(buf), &se);
+	if(service) mygetservbyname_r(service, NULL, &se_buf, buf, sizeof(buf), &se);
 
 	port = se ? se->s_port : htons(atoi(service ? service : "0"));
-	((struct sockaddr_in *) &space->sockaddr_space)->sin_port = port;
+	if(af == AF_INET)
+		((struct sockaddr_in *) &space->sockaddr_space)->sin_port = port;
+	else
+		((struct sockaddr_in6 *) &space->sockaddr_space)->sin6_port = port;
 
 	*res = p = &space->addrinfo_space;
 	assert((size_t)p == (size_t) space);
 
-	p->ai_addr = &space->sockaddr_space;
+	p->ai_addr = (void*) &space->sockaddr_space;
 	if(node)
 		snprintf(space->addr_name, sizeof(space->addr_name), "%s", node);
 	p->ai_canonname = space->addr_name;
 	p->ai_next = NULL;
-	p->ai_family = space->sockaddr_space.sa_family = AF_INET;
-	p->ai_addrlen = sizeof(space->sockaddr_space);
+	p->ai_family = space->sockaddr_space.ss_family = af;
+	p->ai_addrlen = af == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
 
 	if(hints) {
 		p->ai_socktype = hints->ai_socktype;

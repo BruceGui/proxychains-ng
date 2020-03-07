@@ -1,5 +1,5 @@
-#include <netdb.h>
 #include <stdio.h>
+#include <netdb.h>
 #include "../src/common.c"
 
 void printhostent(struct hostent *hp) {
@@ -14,11 +14,10 @@ void printhostent(struct hostent *hp) {
 		ipbuf
 	);
 }
-
-int main(int argc, char** argv) {
-	struct hostent *hp;
-	while((hp = gethostent())) {
-		printhostent(hp);
-	}
+int main(int argc, char**argv) {
+	struct hostent* ret;
+	if(argc == 1) return 1;
+	ret = gethostbyname(argv[1]);
+	if(ret) printhostent(ret);
 	return 0;
 }
